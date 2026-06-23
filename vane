@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import shutil
+import filecmp
+import stat
+from enum import Enum, auto
+from pathlib import Path
+from typing import NoReturn
+
+###############################################################################
+##### Enums #####
+#################
+
+# define valid states for file comparison
+class FileState(Enum):
+    MISSING = auto()
+    IDENTICAL = auto()
+    DIVERGENT = auto()
+
+# define valid actions for resolution
+class SyncAction(Enum):
+    SKIP = auto()
+    OVERWRITE_TARGET = auto()
+    ADOPT_TO_DOTS = auto()
+    ABORT = auto()
+    
+# define valid run modes for the application
+class RunMode(Enum):
+    SYNC = auto()
+    PRUNE = auto()
+    DELETE_MODULE = auto()
+    DELETE_ALL = auto()
+    REBUILD_STATE = auto()
+    UNTRACK_MODULE = auto()
+
+###############################################################################
+##### State Management #####
+############################
+
+# description: loads the tracking state from the plain text manifest
+# parameters:
+#   state_file - path object to the state file
+# returns:
+#   state - set of path objects currently managed (relative to target base)
+def load_state(state_file: Path) -> set[Path]:
+    if not state_file.exists():
+        return set()
+    paths = state_file.read_text().splitlines()
+    return {Path(p) for p in paths if p.strip()}
+
+# description: saves the tracking state to the plain text manifest
+# parameters:
+#   state_file - path object to the state file
+#   state - set of path objects to save
+# returns:
+#   none
+def save_state(state_file: Path, state: set[Path]) -> None:
+    lines = [str(p) for p in sorted(state)]
+    state_file.write_text("\n".join(lines) + "\n")
+
+###############################################################################
+##### Module and Path Discovery #####
+#####################################
+
+# description: scans the modules directory and returns active modules for the os
+# parameters:
+#   modules_dir - path object to the modules directory inside the dots repo
+# returns:
+#   modules - list of path objects representing active module directories
+def get_active_modules(modules_dir: Path) -> list[Path]:
+    modules = []
+    if not modules_dir.exists() or not modules_dir.is_dir():
+        return modules
+        
+    for item in modules_dir.iterdir():
+        if item.is_dir():
+            # target modules prefixed with common- or the current os platform name
+            if item.name.startswith("common-") or item.name.startswith(f"{sys.platform}-"):
+                modules.append(item)
+    return modules
+
+# description: recursively finds all files in a module directory
+# parameters:
+#   module_dir - path object to the module directory
+# returns:
+#   files - list of path objects representing files inside the module
+def get_module_files(module_dir: Path) -> list[Path]:
+    files = []
+    for item in module_dir.rglob('*'):
+        if item.is_file():
+            files.append(item)
+    return files
+
+# description: calculates destination path in the target directory
+# parameters:
+#   src_file - path object to the source file in the module
+#   module_dir - path object to the root of the module
+#   target_base - path object to the target home directory
+# returns:
+#   target_path - path object representing the destination file
+def get_target_path(src_file: Path, module_dir: Path, target_base: Path) -> Path:
+    # calculate the relative path inside the module to append to the home directory
+    relative_path = src_file.relative_to(module_dir)
+    return target_base / relative_path
+
+###############################################################################
+##### Filesystem Operations #####
+#################################
+
+# description: compares source and destination files to determine sync state
+# parameters:
+#   src - path object to source file
+#   dst - path object to destination file
+# returns:
+#   state - filestate enum indicating missing, identical, or divergent
+def evaluate_file_state(src: Path, dst: Path) -> FileState:
+    if not dst.exists():
+        return FileState.MISSING
+        
+    src_resolved = src.resolve()
+        
+    # verify content byte-for-byte against the canonical file
+    content_matches = filecmp.cmp(src_resolved, dst, shallow=False)
+    
+    # verify file permissions match the canonical file
+    src_perms = stat.S_IMODE(os.stat(src_resolved).st_mode)
+    dst_perms = stat.S_IMODE(os.stat(dst).st_mode)
+    permissions_match = (src_perms == dst_perms)
+    
+    if content_matches and permissions_match:
+        return FileState.IDENTICAL
+    return FileState.DIVERGENT
+
+# description: performs file system operations based on sync action
+# parameters:
+#   src - path object to source file
+#   dst - path object to destination file
+#   action - syncaction enum representing user choice
+#   state - set of currently managed paths (relative to home)
+#   target_base - path object to the target home directory
+# returns:
+#   none
+def execute_sync(src: Path, dst: Path, action: SyncAction, state: set[Path], target_base: Path) -> None:
+    if action == SyncAction.SKIP:
+        return
+        
+    relative_dst = dst.relative_to(target_base)
+    src_resolved = src.resolve()
+    
+    if action == SyncAction.OVERWRITE_TARGET:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        # copy the canonical file data, not the symlink
+        shutil.copy2(src_resolved, dst)
+        state.add(relative_dst)
+        print(f"  [resolved] overwrote {dst}")
+        
+    elif action == SyncAction.ADOPT_TO_DOTS:
+        # write the target data back to the canonical file, preserving the symlink in ~/dots
+        shutil.copy2(dst, src_resolved)
+        state.add(relative_dst)
+        print(f"  [resolved] adopted into {src_resolved}")
+        
+    elif action == SyncAction.ABORT:
+        sys.exit(1)
+
+# description: safely deletes a file, cleans empty directories, and untracks state
+# parameters:
+#   target_file - path object to the file to delete
+#   target_base - path object to the target home directory
+#   relative_path - path object relative to home, to remove from state
+#   state - set of currently managed paths
+# returns:
+#   success - boolean indicating if deletion was successful
+def safe_delete_file(target_file: Path, target_base: Path, relative_path: Path, state: set[Path]) -> bool:
+    try:
+        target_file.unlink()
+        cleanup_empty_dirs(target_file, target_base)
+        state.discard(relative_path)
+        return True
+    except OSError as e:
+        print(f"  \033[91m[error]\033[0m failed to remove {target_file}: {e.strerror}", file=sys.stderr)
+        return False
+
+# description: recursively removes empty parent directories up to target_base
+# parameters:
+#   target_file - path object to the deleted file
+#   target_base - path object to the base home directory
+# returns:
+#   none
+def cleanup_empty_dirs(target_file: Path, target_base: Path) -> None:
+    current_dir = target_file.parent
+    while current_dir != target_base:
+        try:
+            if not any(current_dir.iterdir()):
+                current_dir.rmdir()
+                print(f"  [cleaned] empty directory {current_dir}")
+                current_dir = current_dir.parent
+            else:
+                break
+        except OSError:
+            break
+
+###############################################################################
+##### User Interaction #####
+############################
+
+# description: prints the usage instructions for the program and exits
+# parameters:
+#   none
+# returns:
+#   none
+def print_usage() -> NoReturn:
+    print("usage: python dotmgr.py [--prune | --delete <module> | --delete-all | --untrack <module> | --rebuild-state]", file=sys.stderr)
+    print("  no arguments     : syncs active modules to ~", file=sys.stderr)
+    print("  --prune          : removes orphaned files no longer tracked in modules", file=sys.stderr)
+    print("  --delete <mod>   : removes all target files tracked by a specific module", file=sys.stderr)
+    print("  --delete-all     : removes all target files tracked by all active modules", file=sys.stderr)
+    print("  --untrack <mod>  : removes a module's target files from the tracking state without deleting them", file=sys.stderr)
+    print("  --rebuild-state  : regenerates the state file based on existing target files dictated by active modules", file=sys.stderr)
+    sys.exit(1)
+
+# description: parses command line arguments to determine the execution mode
+# parameters:
+#   none
+# returns:
+#   mode - runmode enum representing the action to perform
+#   module_name - string name of the module (or none if not applicable)
+def parse_cli_arguments() -> tuple[RunMode, str | None]:
+    if len(sys.argv) <= 1:
+        return RunMode.SYNC, None
+
+    arg = sys.argv[1]
+    
+    if arg == "--prune" and len(sys.argv) == 2:
+        return RunMode.PRUNE, None
+        
+    elif arg == "--delete" and len(sys.argv) == 3:
+        return RunMode.DELETE_MODULE, sys.argv[2]
+        
+    elif arg == "--delete-all" and len(sys.argv) == 2:
+        return RunMode.DELETE_ALL, None
+        
+    elif arg == "--untrack" and len(sys.argv) == 3:
+        return RunMode.UNTRACK_MODULE, sys.argv[2]
+        
+    elif arg == "--rebuild-state" and len(sys.argv) == 2:
+        return RunMode.REBUILD_STATE, None
+        
+    else:
+        print_usage()
+
+# description: prompts user for a single-character choice with error handling
+# parameters:
+#   prompt_text - string to display to the user
+#   valid_choices - tuple of valid single-character strings
+# returns:
+#   choice - valid character string entered by the user
+def get_user_choice(prompt_text: str, valid_choices: tuple[str, ...]) -> str:
+    while True:
+        try:
+            choice = input(prompt_text).strip().lower()
+            if choice in valid_choices:
+                return choice
+        except (KeyboardInterrupt, EOFError):
+            print("\n  quitting.")
+            sys.exit(1)
+
+###############################################################################
+##### Execution Modes #####
+###########################
+
+# description: evaluates and synchronizes active modules to the target directory
+# parameters:
+#   modules_dir - path object to the modules directory
+#   target_base - path object to the target home directory
+#   state - set of currently managed paths
+# returns:
+#   none
+def run_sync(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+    modules = get_active_modules(modules_dir)
+    if not modules:
+        print(f"no active modules found for '{sys.platform}' in {modules_dir}.")
+        return
+
+    for module in modules:
+        print(f"\nprocessing module: {module.name}")
+        files = get_module_files(module)
+        
+        for src_file in files:
+            dst_file = get_target_path(src_file, module, target_base)
+            file_eval = evaluate_file_state(src_file, dst_file)
+            
+            if file_eval == FileState.IDENTICAL:
+                print(f"  [ok] {dst_file}")
+                action = SyncAction.SKIP
+                
+            elif file_eval == FileState.MISSING:
+                print(f"  [new] {dst_file}")
+                action = SyncAction.OVERWRITE_TARGET
+                
+            elif file_eval == FileState.DIVERGENT:
+                print(f"  [conflict] {dst_file} differs from source")
+                choice = get_user_choice(
+                    "  action [o]verwrite target, [a]dopt to dots, [s]kip, [q]uit: ",
+                    ('o', 'a', 's', 'q')
+                )
+                
+                action_map = {
+                    'o': SyncAction.OVERWRITE_TARGET,
+                    'a': SyncAction.ADOPT_TO_DOTS,
+                    's': SyncAction.SKIP,
+                    'q': SyncAction.ABORT
+                }
+                action = action_map[choice]
+                
+            else:
+                # fail loudly if a new FileState enum is added but not handled here
+                raise NotImplementedError(f"unhandled file state: {file_eval}")
+            
+            execute_sync(src_file, dst_file, action, state, target_base)
+
+# description: executes the interactive pruning of orphaned files
+# parameters:
+#   modules_dir - path object to the modules directory
+#   target_base - path object to the target home directory
+#   state - set of currently managed paths
+# returns:
+#   none
+def run_prune(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+    active_dst_paths = set()
+    modules = get_active_modules(modules_dir)
+    for module in modules:
+        for src_file in get_module_files(module):
+            dst_file = get_target_path(src_file, module, target_base)
+            active_dst_paths.add(dst_file.relative_to(target_base))
+    
+    orphans = state - active_dst_paths
+    if not orphans:
+        print("no orphaned files found.")
+        return
+
+    print(f"found {len(orphans)} orphaned file(s).")
+    for orphan in list(orphans):
+        dst = target_base / orphan
+        if not dst.exists():
+            state.discard(orphan)
+            continue
+            
+        print(f"\n  [orphan] {dst}")
+        choice = get_user_choice(
+            "  action [r]emove file & untrack, [u]ntrack only, [s]kip, [q]uit: ",
+            ('r', 'u', 's', 'q')
+        )
+        
+        if choice == 'r':
+            if safe_delete_file(dst, target_base, orphan, state):
+                print(f"  [removed] {dst}")
+        elif choice == 'u':
+            state.discard(orphan)
+            print(f"  [untracked] {dst}")
+        elif choice == 's':
+            print(f"  [skipped] {dst}")
+        elif choice == 'q':
+            print("\n  quitting.")
+            sys.exit(1)
+
+# description: removes all tracked files for a specific module, prompting on divergence
+# parameters:
+#   module_name - string name of the module to delete
+#   modules_dir - path object to the modules directory
+#   target_base - path object to the target home directory
+#   state - set of currently managed paths
+# returns:
+#   none
+def delete_module(module_name: str, modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+    target_module = modules_dir / module_name
+    
+    if not target_module.exists():
+        print(f"module {module_name} not found.", file=sys.stderr)
+        return
+        
+    for src_file in get_module_files(target_module):
+        dst_file = get_target_path(src_file, target_module, target_base)
+        relative_dst = dst_file.relative_to(target_base)
+        
+        if not dst_file.exists():
+            state.discard(relative_dst)
+            continue
+            
+        file_eval = evaluate_file_state(src_file, dst_file)
+        
+        if file_eval == FileState.DIVERGENT:
+            print(f"\n  [conflict] {dst_file} has uncommitted changes.")
+            choice = get_user_choice(
+                "  action [f]orce delete, [u]ntrack only, [s]kip, [q]uit: ",
+                ('f', 'u', 's', 'q')
+            )
+            
+            if choice == 'f':
+                print(f"  [removing] {dst_file}")
+                safe_delete_file(dst_file, target_base, relative_dst, state)
+            elif choice == 'u':
+                state.discard(relative_dst)
+                print(f"  [untracked] {dst_file}")
+            elif choice == 's':
+                print(f"  [skipped] {dst_file}")
+            elif choice == 'q':
+                print("\n  quitting.")
+                sys.exit(1)
+        else:
+            print(f"  [removing] {dst_file}")
+            safe_delete_file(dst_file, target_base, relative_dst, state)
+
+# description: removes all tracked files across all active modules
+# parameters:
+#   modules_dir - path object to the modules directory
+#   target_base - path object to the target home directory
+#   state - set of currently managed paths
+# returns:
+#   none
+def delete_all(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+    modules = get_active_modules(modules_dir)
+    if not modules:
+        print("no active modules found to delete.", file=sys.stderr)
+        return
+        
+    try:
+        choice = input(f"warning: this will remove ALL target files defined in your active modules from {target_base}. continue? [y/n]: ").strip().lower()
+        if choice != 'y':
+            print("quitting.")
+            sys.exit(0)
+    except (KeyboardInterrupt, EOFError):
+        print("\nquitting.")
+        sys.exit(1)
+        
+    for module in modules:
+        delete_module(module.name, modules_dir, target_base, state)
+
+# description: removes all tracked files for a specific module from the manifest without deleting them
+# parameters:
+#   module_name - string name of the module to untrack
+#   modules_dir - path object to the modules directory
+#   target_base - path object to the target home directory
+#   state - set of currently managed paths
+# returns:
+#   none
+def untrack_module(module_name: str, modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+    target_module = modules_dir / module_name
+    
+    if not target_module.exists():
+        print(f"module {module_name} not found.", file=sys.stderr)
+        return
+        
+    untracked_count = 0
+    for src_file in get_module_files(target_module):
+        dst_file = get_target_path(src_file, target_module, target_base)
+        relative_dst = dst_file.relative_to(target_base)
+        
+        if relative_dst in state:
+            state.discard(relative_dst)
+            untracked_count += 1
+            print(f"  [untracked] {dst_file}")
+            
+    print(f"untracked {untracked_count} file(s) for module {module_name}.")
+
+# description: regenerates the tracking manifest based on current active modules
+# parameters:
+#   modules_dir - path object to the modules directory
+#   target_base - path object to the target home directory
+#   state_file - path object to the state file
+# returns:
+#   none
+def rebuild_state(modules_dir: Path, target_base: Path, state_file: Path) -> None:
+    new_state = set()
+    modules = get_active_modules(modules_dir)
+    
+    if not modules:
+        print("no active modules found. clearing state file.", file=sys.stderr)
+    else:
+        for module in modules:
+            for src_file in get_module_files(module):
+                dst_file = get_target_path(src_file, module, target_base)
+                if dst_file.exists():
+                    new_state.add(dst_file.relative_to(target_base))
+                    
+        print(f"state file rebuilt with {len(new_state)} tracked files.")
+        
+    save_state(state_file, new_state)
+
+###############################################################################
+##### Entrypoint #####
+######################
+
+# description: main entrypoint for the application
+# parameters:
+#   none
+# returns:
+#   none
+def main() -> None:
+    # where modules are located
+    modules_dir = Path.home() / "vane" / "modules"
+
+    # target where files will be copied to
+    target_base = Path.home()
+    
+    # where to create and load state
+    xdg_state_home = os.environ.get('XDG_STATE_HOME', str(Path.home() / ".local" / "state"))
+    state_dir = Path(xdg_state_home) / "vane"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_file = state_dir / "state.txt"
+
+    # load state and determine mode
+    state = load_state(state_file)
+    mode, module_arg = parse_cli_arguments()
+
+    if mode == RunMode.PRUNE:
+        run_prune(modules_dir, target_base, state)
+        save_state(state_file, state)
+        
+    elif mode == RunMode.DELETE_MODULE:
+        assert module_arg is not None
+        if not (modules_dir / module_arg).exists():
+            print(f"module {module_arg} not found.", file=sys.stderr)
+            sys.exit(1)
+        delete_module(module_arg, modules_dir, target_base, state)
+        save_state(state_file, state)
+        
+    elif mode == RunMode.DELETE_ALL:
+        delete_all(modules_dir, target_base, state)
+        save_state(state_file, state)
+       
+    elif mode == RunMode.UNTRACK_MODULE:
+        assert module_arg is not None
+        if not (modules_dir / module_arg).exists():
+            print(f"module {module_arg} not found.", file=sys.stderr)
+            sys.exit(1)
+        untrack_module(module_arg, modules_dir, target_base, state)
+        save_state(state_file, state)
+
+    elif mode == RunMode.REBUILD_STATE:
+        rebuild_state(modules_dir, target_base, state_file)
+        
+    elif mode == RunMode.SYNC:
+        run_sync(modules_dir, target_base, state)
+        save_state(state_file, state)
+
+if __name__ == "__main__":
+    main()

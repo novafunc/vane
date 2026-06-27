@@ -17,7 +17,7 @@ So I built Vane. It just does what I want, without annoyances, while being simpl
 
 Vane does not use links for a couple of reasons.
 
-- Hard links are undesirable because they are unpredictable. Some programs may overwrite a hard link and lose the connection to file in the managed directory.
+- Hard links are undesirable because they do not work across fileystem boundaries. They are also unpredictable; some programs may overwrite a hard link, severing the connection to file in the managed directory.
 - Symbolic links are problematic when it comes to sandboxing. A flatpak may struggle to follow a relative link that goes outisde of the sandbox and requires access to the managed directory.
 
 To avoid these issues, real files are used instead. Real files are not perfect either, but here is how vane works around some issues.

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import fnmatch
 import sys
 import os
 import shutil
@@ -81,15 +82,16 @@ def get_active_modules(modules_dir: Path) -> list[Path]:
                 modules.append(item)
     return modules
 
-# description: recursively finds all files in a module directory
+# description: recursively finds all non-ignored files in a module directory
 # parameters:
 #   module_dir - path object to the module directory
+#   ignore_patterns - list of string glob patterns
 # returns:
 #   files - list of path objects representing files inside the module
-def get_module_files(module_dir: Path) -> list[Path]:
+def get_module_files(module_dir: Path, ignore_patterns: list[str]) -> list[Path]:
     files = []
     for item in module_dir.rglob('*'):
-        if item.is_file():
+        if item.is_file() and not is_ignored(item, ignore_patterns):
             files.append(item)
     return files
 
@@ -104,6 +106,35 @@ def get_target_path(src_file: Path, module_dir: Path, target_base: Path) -> Path
     # calculate the relative path inside the module to append to the home directory
     relative_path = src_file.relative_to(module_dir)
     return target_base / relative_path
+
+# description: loads ignore patterns from a .vaneignore file
+# parameters:
+#   ignore_file - path object to the .vaneignore file
+# returns:
+#   patterns - list of string glob patterns
+def load_ignore_patterns(ignore_file: Path) -> list[str]:
+    if not ignore_file.exists():
+        return []
+        
+    patterns = []
+    for line in ignore_file.read_text().splitlines():
+        stripped = line.strip()
+        # ignore empty lines and comments
+        if stripped and not stripped.startswith('#'):
+            patterns.append(stripped)
+    return patterns
+
+# description: evaluates if a file matches any ignore patterns
+# parameters:
+#   file_path - path object to the file
+#   patterns - list of string glob patterns
+# returns:
+#   boolean indicating if the file should be ignored
+def is_ignored(file_path: Path, patterns: list[str]) -> bool:
+    for pattern in patterns:
+        if fnmatch.fnmatch(file_path.name, pattern):
+            return True
+    return False
 
 ###############################################################################
 ##### Filesystem Operations #####
@@ -278,7 +309,7 @@ def get_user_choice(prompt_text: str, valid_choices: tuple[str, ...]) -> str:
 #   state - set of currently managed paths
 # returns:
 #   none
-def run_sync(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+def run_sync(modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
     modules = get_active_modules(modules_dir)
     if not modules:
         print(f"no active modules found for '{sys.platform}' in {modules_dir}.")
@@ -286,7 +317,7 @@ def run_sync(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
 
     for module in modules:
         print(f"\nprocessing module: {module.name}")
-        files = get_module_files(module)
+        files = get_module_files(module, ignore_patterns)
         
         for src_file in files:
             dst_file = get_target_path(src_file, module, target_base)
@@ -328,11 +359,11 @@ def run_sync(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
 #   state - set of currently managed paths
 # returns:
 #   none
-def run_prune(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+def run_prune(modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
     active_dst_paths = set()
     modules = get_active_modules(modules_dir)
     for module in modules:
-        for src_file in get_module_files(module):
+        for src_file in get_module_files(module, ignore_patterns):
             dst_file = get_target_path(src_file, module, target_base)
             active_dst_paths.add(dst_file.relative_to(target_base))
     
@@ -374,14 +405,14 @@ def run_prune(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
 #   state - set of currently managed paths
 # returns:
 #   none
-def delete_module(module_name: str, modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+def delete_module(module_name: str, modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
     target_module = modules_dir / module_name
     
     if not target_module.exists():
         print(f"module {module_name} not found.", file=sys.stderr)
         return
         
-    for src_file in get_module_files(target_module):
+    for src_file in get_module_files(target_module, ignore_patterns):
         dst_file = get_target_path(src_file, target_module, target_base)
         relative_dst = dst_file.relative_to(target_base)
         
@@ -420,7 +451,7 @@ def delete_module(module_name: str, modules_dir: Path, target_base: Path, state:
 #   state - set of currently managed paths
 # returns:
 #   none
-def delete_all(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+def delete_all(modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
     modules = get_active_modules(modules_dir)
     if not modules:
         print("no active modules found to delete.", file=sys.stderr)
@@ -436,7 +467,7 @@ def delete_all(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
         sys.exit(1)
         
     for module in modules:
-        delete_module(module.name, modules_dir, target_base, state)
+        delete_module(module.name, modules_dir, target_base, state, ignore_patterns)
 
 # description: removes all tracked files for a specific module from the manifest without deleting them
 # parameters:
@@ -446,7 +477,7 @@ def delete_all(modules_dir: Path, target_base: Path, state: set[Path]) -> None:
 #   state - set of currently managed paths
 # returns:
 #   none
-def untrack_module(module_name: str, modules_dir: Path, target_base: Path, state: set[Path]) -> None:
+def untrack_module(module_name: str, modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
     target_module = modules_dir / module_name
     
     if not target_module.exists():
@@ -454,7 +485,7 @@ def untrack_module(module_name: str, modules_dir: Path, target_base: Path, state
         return
         
     untracked_count = 0
-    for src_file in get_module_files(target_module):
+    for src_file in get_module_files(target_module, ignore_patterns):
         dst_file = get_target_path(src_file, target_module, target_base)
         relative_dst = dst_file.relative_to(target_base)
         
@@ -472,7 +503,7 @@ def untrack_module(module_name: str, modules_dir: Path, target_base: Path, state
 #   state_file - path object to the state file
 # returns:
 #   none
-def rebuild_state(modules_dir: Path, target_base: Path, state_file: Path) -> None:
+def rebuild_state(modules_dir: Path, target_base: Path, state_file: Path, ignore_patterns: list[str]) -> None:
     new_state = set()
     modules = get_active_modules(modules_dir)
     
@@ -480,7 +511,7 @@ def rebuild_state(modules_dir: Path, target_base: Path, state_file: Path) -> Non
         print("no active modules found. clearing state file.", file=sys.stderr)
     else:
         for module in modules:
-            for src_file in get_module_files(module):
+            for src_file in get_module_files(module, ignore_patterns):
                 dst_file = get_target_path(src_file, module, target_base)
                 if dst_file.exists():
                     new_state.add(dst_file.relative_to(target_base))
@@ -499,24 +530,22 @@ def rebuild_state(modules_dir: Path, target_base: Path, state_file: Path) -> Non
 # returns:
 #   none
 def main() -> None:
-    # where modules are located
-    modules_dir = Path.home() / "vane" / "modules"
+    # where vane stuff is stored
+    vane_root = Path.home() / "vane"
+    modules_dir = vane_root / "modules"
+    state_file = vane_root / ".vane_state"
+    ignore_file = vane_root / ".vane_ignore"
 
     # target where files will be copied to
     target_base = Path.home()
-    
-    # where to create and load state
-    xdg_state_home = os.environ.get('XDG_STATE_HOME', str(Path.home() / ".local" / "state"))
-    state_dir = Path(xdg_state_home) / "vane"
-    state_dir.mkdir(parents=True, exist_ok=True)
-    state_file = state_dir / "state.txt"
 
-    # load state and determine mode
+    # load state, ignored files, and determine mode
     state = load_state(state_file)
+    ignore_patterns = load_ignore_patterns(ignore_file)
     mode, module_arg = parse_cli_arguments()
 
     if mode == RunMode.PRUNE:
-        run_prune(modules_dir, target_base, state)
+        run_prune(modules_dir, target_base, state, ignore_patterns)
         save_state(state_file, state)
         
     elif mode == RunMode.DELETE_MODULE:
@@ -524,11 +553,11 @@ def main() -> None:
         if not (modules_dir / module_arg).exists():
             print(f"module {module_arg} not found.", file=sys.stderr)
             sys.exit(1)
-        delete_module(module_arg, modules_dir, target_base, state)
+        delete_module(module_arg, modules_dir, target_base, state, ignore_patterns)
         save_state(state_file, state)
         
     elif mode == RunMode.DELETE_ALL:
-        delete_all(modules_dir, target_base, state)
+        delete_all(modules_dir, target_base, state, ignore_patterns)
         save_state(state_file, state)
        
     elif mode == RunMode.UNTRACK_MODULE:
@@ -536,14 +565,14 @@ def main() -> None:
         if not (modules_dir / module_arg).exists():
             print(f"module {module_arg} not found.", file=sys.stderr)
             sys.exit(1)
-        untrack_module(module_arg, modules_dir, target_base, state)
+        untrack_module(module_arg, modules_dir, target_base, state, ignore_patterns)
         save_state(state_file, state)
 
     elif mode == RunMode.REBUILD_STATE:
-        rebuild_state(modules_dir, target_base, state_file)
+        rebuild_state(modules_dir, target_base, state_file, ignore_patterns)
         
     elif mode == RunMode.SYNC:
-        run_sync(modules_dir, target_base, state)
+        run_sync(modules_dir, target_base, state, ignore_patterns)
         save_state(state_file, state)
 
 if __name__ == "__main__":

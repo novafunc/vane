@@ -67,7 +67,7 @@ def save_state(state_file: Path, state: set[Path]) -> None:
 
 # description: scans the modules directory and returns active modules for the os
 # parameters:
-#   modules_dir - path object to the modules directory inside the dots repo
+#   modules_dir - path object to the modules directory inside the vane repo
 # returns:
 #   modules - list of path objects representing active module directories
 def get_active_modules(modules_dir: Path) -> list[Path]:
@@ -147,10 +147,16 @@ def is_ignored(file_path: Path, patterns: list[str]) -> bool:
 # returns:
 #   state - filestate enum indicating missing, identical, or divergent
 def evaluate_file_state(src: Path, dst: Path) -> FileState:
-    if not dst.exists():
+    # check if path exists OR if it is a broken symlink
+    if not dst.exists() and not dst.is_symlink():
         return FileState.MISSING
         
     src_resolved = src.resolve()
+
+    # if the destination is a symlink (broken or valid), it is divergent 
+    # because vane enforces real files
+    if dst.is_symlink():
+        return FileState.DIVERGENT
         
     # verify content byte-for-byte against the canonical file
     content_matches = filecmp.cmp(src_resolved, dst, shallow=False)
@@ -162,6 +168,7 @@ def evaluate_file_state(src: Path, dst: Path) -> FileState:
     
     if content_matches and permissions_match:
         return FileState.IDENTICAL
+
     return FileState.DIVERGENT
 
 # description: performs file system operations based on sync action
@@ -182,13 +189,18 @@ def execute_sync(src: Path, dst: Path, action: SyncAction, state: set[Path], tar
     
     if action == SyncAction.OVERWRITE_TARGET:
         dst.parent.mkdir(parents=True, exist_ok=True)
+
+        # clear the destination if it is a broken symlink or existing file
+        if dst.is_symlink() or dst.exists():
+            dst.unlink()
+
         # copy the canonical file data, not the symlink
         shutil.copy2(src_resolved, dst)
         state.add(relative_dst)
         print(f"  [resolved] overwrote {dst}")
         
     elif action == SyncAction.ADOPT_TO_DOTS:
-        # write the target data back to the canonical file, preserving the symlink in ~/dots
+        # write the target data back to the canonical file, preserving the symlink in ~/vane
         shutil.copy2(dst, src_resolved)
         state.add(relative_dst)
         print(f"  [resolved] adopted into {src_resolved}")
@@ -243,7 +255,7 @@ def cleanup_empty_dirs(target_file: Path, target_base: Path) -> None:
 # returns:
 #   none
 def print_usage() -> NoReturn:
-    print("usage: python dotmgr.py [--prune | --delete <module> | --delete-all | --untrack <module> | --rebuild-state]", file=sys.stderr)
+    print("usage: vane [--prune | --delete <module> | --delete-all | --untrack <module> | --rebuild-state]", file=sys.stderr)
     print("  no arguments     : syncs active modules to ~", file=sys.stderr)
     print("  --prune          : removes orphaned files no longer tracked in modules", file=sys.stderr)
     print("  --delete <mod>   : removes all target files tracked by a specific module", file=sys.stderr)
@@ -335,7 +347,7 @@ def run_sync(modules_dir: Path, target_base: Path, state: set[Path], ignore_patt
             elif file_eval == FileState.DIVERGENT:
                 print(f"  [conflict] {dst_file} differs from source")
                 choice = get_user_choice(
-                    "  action [o]verwrite target, [a]dopt to dots, [s]kip, [q]uit: ",
+                    "  action [o]verwrite target, [a]dopt to vane, [s]kip, [q]uit: ",
                     ('o', 'a', 's', 'q')
                 )
                 

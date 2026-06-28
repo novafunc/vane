@@ -307,6 +307,7 @@ def get_user_choice(prompt_text: str, valid_choices: tuple[str, ...]) -> str:
 #   modules_dir - path object to the modules directory
 #   target_base - path object to the target home directory
 #   state - set of currently managed paths
+#   ignore_patterns - list of string glob patterns
 # returns:
 #   none
 def run_sync(modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
@@ -357,6 +358,7 @@ def run_sync(modules_dir: Path, target_base: Path, state: set[Path], ignore_patt
 #   modules_dir - path object to the modules directory
 #   target_base - path object to the target home directory
 #   state - set of currently managed paths
+#   ignore_patterns - list of string glob patterns
 # returns:
 #   none
 def run_prune(modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
@@ -403,6 +405,7 @@ def run_prune(modules_dir: Path, target_base: Path, state: set[Path], ignore_pat
 #   modules_dir - path object to the modules directory
 #   target_base - path object to the target home directory
 #   state - set of currently managed paths
+#   ignore_patterns - list of string glob patterns
 # returns:
 #   none
 def delete_module(module_name: str, modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
@@ -449,6 +452,7 @@ def delete_module(module_name: str, modules_dir: Path, target_base: Path, state:
 #   modules_dir - path object to the modules directory
 #   target_base - path object to the target home directory
 #   state - set of currently managed paths
+#   ignore_patterns - list of string glob patterns
 # returns:
 #   none
 def delete_all(modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
@@ -475,6 +479,7 @@ def delete_all(modules_dir: Path, target_base: Path, state: set[Path], ignore_pa
 #   modules_dir - path object to the modules directory
 #   target_base - path object to the target home directory
 #   state - set of currently managed paths
+#   ignore_patterns - list of string glob patterns
 # returns:
 #   none
 def untrack_module(module_name: str, modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
@@ -501,6 +506,7 @@ def untrack_module(module_name: str, modules_dir: Path, target_base: Path, state
 #   modules_dir - path object to the modules directory
 #   target_base - path object to the target home directory
 #   state_file - path object to the state file
+#   ignore_patterns - list of string glob patterns
 # returns:
 #   none
 def rebuild_state(modules_dir: Path, target_base: Path, state_file: Path, ignore_patterns: list[str]) -> None:

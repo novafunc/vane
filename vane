@@ -136,6 +136,84 @@ def is_ignored(file_path: Path, patterns: list[str]) -> bool:
             return True
     return False
 
+# description: groups target destinations by their resolved canonical source paths
+# parameters:
+#    modules_dir - path object to the modules directory
+#    target_base - path object to the target home directory
+#    ignore_patterns - list of string glob patterns
+# returns:
+#    mapping - dictionary mapping canonical source paths to a list of (source, target) pairs
+def build_canonical_mapping(modules_dir: Path, target_base: Path, ignore_patterns: list[str]) -> dict[Path, list[tuple[Path, Path]]]:
+    mapping = {}
+    modules = get_active_modules(modules_dir)
+    for module in modules:
+        for src_file in get_module_files(module, ignore_patterns):
+            canonical_src = src_file.resolve()
+            dst_file = get_target_path(src_file, module, target_base)
+            mapping.setdefault(canonical_src, []).append((src_file, dst_file))
+    return mapping
+
+# description: processes evaluation and sync actions for a shared canonical source group
+# parameters:
+#    canonical_src - path object to the resolved canonical source file
+#    group_mappings - list of tuples containing the module source path and target path
+#    state - set of currently managed paths
+#    target_base - path object to the target home directory
+# returns:
+#    none
+def process_canonical_group(canonical_src: Path, group_mappings: list[tuple[Path, Path]], state: set[Path], target_base: Path) -> None:
+    evals = []
+    adopted_item = None
+
+    for src_file, dst_file in group_mappings:
+        file_eval = evaluate_file_state(src_file, dst_file)
+        action = SyncAction.SKIP
+        
+        if file_eval == FileState.IDENTICAL:
+            action = SyncAction.SKIP
+        elif file_eval == FileState.MISSING:
+            action = SyncAction.OVERWRITE_TARGET
+        elif file_eval == FileState.DIVERGENT:
+            print(f"  [conflict] {dst_file} differs from source")
+            choice = get_user_choice(
+                "  action [o]verwrite target, [a]dopt to vane, [s]kip, [q]uit: ",
+                ('o', 'a', 's', 'q')
+            )
+            action_map = {
+                'o': SyncAction.OVERWRITE_TARGET,
+                'a': SyncAction.ADOPT_TO_DOTS,
+                's': SyncAction.SKIP,
+                'q': SyncAction.ABORT
+            }
+            action = action_map[choice]
+        
+        item = {'src': src_file, 'dst': dst_file, 'eval': file_eval, 'action': action}
+        evals.append(item)
+        
+        if action == SyncAction.ADOPT_TO_DOTS:
+            adopted_item = item
+            break
+
+    if adopted_item:
+        # execute adoption first to update the underlying canonical file on disk
+        execute_sync(adopted_item['src'], adopted_item['dst'], SyncAction.ADOPT_TO_DOTS, state, target_base)
+        
+        # force update all other target files pointing to this canonical file
+        for src_file, dst_file in group_mappings:
+            if dst_file == adopted_item['dst']:
+                continue
+            print(f"  [sync shared] updating link-partner {dst_file}")
+            execute_sync(src_file, dst_file, SyncAction.OVERWRITE_TARGET, state, target_base)
+    else:
+        # execute standard planned actions when no adoption occurs
+        for item in evals:
+            if item['eval'] == FileState.IDENTICAL:
+                print(f"  [ok] {item['dst']}")
+            elif item['eval'] == FileState.MISSING:
+                print(f"  [new] {item['dst']}")
+            
+            execute_sync(item['src'], item['dst'], item['action'], state, target_base)
+
 ###############################################################################
 ##### Filesystem Operations #####
 #################################
@@ -314,56 +392,22 @@ def get_user_choice(prompt_text: str, valid_choices: tuple[str, ...]) -> str:
 ##### Execution Modes #####
 ###########################
 
-# description: evaluates and synchronizes active modules to the target directory
+# description: evaluates and synchronizes active modules using canonical grouping
 # parameters:
-#   modules_dir - path object to the modules directory
-#   target_base - path object to the target home directory
-#   state - set of currently managed paths
-#   ignore_patterns - list of string glob patterns
+#    modules_dir - path object to the modules directory
+#    target_base - path object to the target home directory
+#    state - set of currently managed paths
+#    ignore_patterns - list of string glob patterns
 # returns:
-#   none
+#    none
 def run_sync(modules_dir: Path, target_base: Path, state: set[Path], ignore_patterns: list[str]) -> None:
-    modules = get_active_modules(modules_dir)
-    if not modules:
+    canonical_mapping = build_canonical_mapping(modules_dir, target_base, ignore_patterns)
+    if not canonical_mapping:
         print(f"no active modules found for '{sys.platform}' in {modules_dir}.")
         return
 
-    for module in modules:
-        print(f"\nprocessing module: {module.name}")
-        files = get_module_files(module, ignore_patterns)
-        
-        for src_file in files:
-            dst_file = get_target_path(src_file, module, target_base)
-            file_eval = evaluate_file_state(src_file, dst_file)
-            
-            if file_eval == FileState.IDENTICAL:
-                print(f"  [ok] {dst_file}")
-                action = SyncAction.SKIP
-                
-            elif file_eval == FileState.MISSING:
-                print(f"  [new] {dst_file}")
-                action = SyncAction.OVERWRITE_TARGET
-                
-            elif file_eval == FileState.DIVERGENT:
-                print(f"  [conflict] {dst_file} differs from source")
-                choice = get_user_choice(
-                    "  action [o]verwrite target, [a]dopt to vane, [s]kip, [q]uit: ",
-                    ('o', 'a', 's', 'q')
-                )
-                
-                action_map = {
-                    'o': SyncAction.OVERWRITE_TARGET,
-                    'a': SyncAction.ADOPT_TO_DOTS,
-                    's': SyncAction.SKIP,
-                    'q': SyncAction.ABORT
-                }
-                action = action_map[choice]
-                
-            else:
-                # fail loudly if a new FileState enum is added but not handled here
-                raise NotImplementedError(f"unhandled file state: {file_eval}")
-            
-            execute_sync(src_file, dst_file, action, state, target_base)
+    for canonical_src, group_mappings in canonical_mapping.items():
+        process_canonical_group(canonical_src, group_mappings, state, target_base)
 
 # description: executes the interactive pruning of orphaned files
 # parameters:
